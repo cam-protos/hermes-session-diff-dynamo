@@ -1,0 +1,17 @@
+{
+  "name": "hermes-session-diff",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/plugin.jsx --bundle --format=esm --jsx=automatic --external:react --external:react/jsx-runtime --external:@hermes/plugin-sdk --outfile=desktop/plugin.js",
+    "test": "node tests/diff-rows.mjs",
+    "test:browser": "node tests/browser.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.12",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "@playwright/test": "^1.63.0"
+  }
+}

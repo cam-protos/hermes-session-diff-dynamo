@@ -1,0 +1,20 @@
+name: hermes-session-diff
+version: 0.1.0
+description: Persistent session file changes and quick diffs in Hermes Desktop.
+author: Adolanium
+license: MIT
+manifest_version: 1
+kind: standalone
+provides_tools: []
+provides_hooks: [pre_llm_call]
+provides_middleware: [tool_execution]
+requires_env: []
+config_schema:
+  retention_days:
+    type: integer
+    default: 30
+    description: Days to retain recorded changes.
+  terminal_capture:
+    type: boolean
+    default: true
+    description: Compare bounded workspace snapshots around terminal commands.

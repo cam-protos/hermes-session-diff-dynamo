@@ -1,0 +1,33 @@
+name: Check plugin
+on:
+  push:
+  pull_request:
+jobs:
+  recorder:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m unittest discover -s tests -p 'test_*.py' -v
+  desktop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: node tests/diff-rows.mjs
+      - run: git diff --exit-code -- desktop/plugin.js
+      - run: python scripts/package.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermes-session-diff
+          path: dist/*.zip
