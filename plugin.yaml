@@ -4,6 +4,7 @@ description: Persistent session file changes and quick diffs in Hermes Desktop.
 author: Adolanium
 license: MIT
 manifest_version: 1
+requires_hermes: ">=0.21.3"
 kind: standalone
 provides_tools: []
 provides_hooks: [pre_llm_call]

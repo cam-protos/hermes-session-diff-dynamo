@@ -11,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from session_diff.recorder import Recorder, file_targets
 from session_diff.store import Store
-from session_diff.capture import snapshot
+from session_diff.capture import snapshot, workspace
 
 
 class RecorderTests(unittest.TestCase):
@@ -78,6 +78,25 @@ class RecorderTests(unittest.TestCase):
         files = self.store.view('session-a')['files']
         self.assertEqual({Path(f['path']).name: f['status'] for f in files}, {'old.txt': 'deleted', 'new.txt': 'added'})
         self.assertTrue(all(f['observed'] for f in files))
+
+    def test_workspace_below_alias_excludes_links_inside_workspace(self):
+        physical = self.root / 'physical'
+        physical.mkdir()
+        chosen = physical / 'parent' / 'chosen'
+        chosen.mkdir(parents=True)
+        (chosen / 'normal.txt').write_text('record this')
+        outside = physical / 'outside'
+        outside.mkdir()
+        (outside / 'private.txt').write_text('do not record')
+        alias = self.root / 'alias'
+        try:
+            alias.symlink_to(physical, target_is_directory=True)
+            (chosen / 'linked').symlink_to(outside, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f'Directory symlinks unavailable: {exc}')
+        captured, _, notes = workspace(alias / 'parent' / 'chosen')
+        self.assertEqual({Path(name).name for name in captured}, {'normal.txt'})
+        self.assertEqual(notes, [])
 
     def test_run_isolation_and_intervening_edits(self):
         path = self.work / 'app.txt'

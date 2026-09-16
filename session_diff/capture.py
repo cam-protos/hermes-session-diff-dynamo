@@ -99,8 +99,10 @@ def workspace(root, blocked=None):
                 break
             if excluded(path):
                 continue
-            # Ignore a link at any directory level, including Git-tracked paths.
-            if any(parent.is_symlink() for parent in [path, *path.parents] if parent != root.parent):
+            # Check the chosen workspace and its children, not system aliases
+            # above it (for example /var -> /private/var on macOS).
+            relative = path.relative_to(root)
+            if any((root / part).is_symlink() for part in [relative, *relative.parents]):
                 continue
             meta, data = snapshot(path, blocked)
             captured[str(path)] = meta
