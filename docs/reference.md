@@ -32,16 +32,40 @@ Capture begins when the plugin is enabled; it cannot reconstruct the original co
 
 ## Storage, limits and settings
 
-The journal lives at `$HERMES_HOME/plugin-data/hermes-session-diff/changes.sqlite3`. It is profile-local and survives restarts. Snapshots can contain source code and other file contents. Nothing is uploaded. Unix installations create the data directory and database with owner-only permissions; Windows uses the directory's inherited permissions.
+The journal has no local database. Run and change records live in one **DynamoDB** table; snapshot contents live in **S3**, content-addressed at `<prefix>/blobs/<sha256>` and written with `AES256` server-side encryption. Snapshots can contain source code and other file contents, so restrict the bucket and table to the roles that run and read the plugin. Any process with the same configuration reads the same journal, which is how a separate UI container can display changes recorded by the gateway.
+
+### Provisioning
+
+Create the table with on-demand billing, partition key `pk` (S), sort key `sk` (S) and a global secondary index `gsi` on `gpk` (S) / `gsk` (N) projecting all attributes. `session_diff.store.table_definition(name)` returns the exact `create_table` arguments:
+
+```sh
+python -c "import json; from session_diff.store import table_definition as t; print(json.dumps(t('session-diff')))" > table.json
+aws dynamodb create-table --cli-input-json file://table.json
+```
+
+Create or choose a private S3 bucket. The plugin never creates resources.
+
+| Setting | Environment variable | Meaning |
+| --- | --- | --- |
+| `dynamodb_table` | `SESSION_DIFF_TABLE` | Table name (required) |
+| `s3_bucket` | `SESSION_DIFF_BUCKET` | Bucket name (required) |
+| `s3_prefix` | `SESSION_DIFF_PREFIX` | Key prefix, default `session-diff` |
+| `aws_region` | `SESSION_DIFF_REGION` | Region; empty uses the standard AWS chain |
+
+Environment variables win over settings. Credentials come from the standard AWS chain (for example an ECS task role).
+
+Permissions: the **recorder** needs `dynamodb:GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query`, `BatchWriteItem` on the table and its `gsi` index, and `s3:PutObject`, `GetObject`, `DeleteObject` on `<prefix>/blobs/*`. A **read-only viewer** needs only `GetItem` and `Query` on the table and index, and `s3:GetObject` on the same prefix.
+
+Item layout (for operators): `S#<session>/META`, `S#<session>/RUN#<run>`, `S#<session>/CHG#<id>`, `BLOB#<hash>/REF` (reference count), and `STATS/BLOBS` (byte budget). Blobs are reference counted, so a snapshot shared by several changes is deleted only after the last one expires.
 
 The recorder excludes common credential filenames, private-key files, dependency/build directories, links, devices, and paths blocked by Hermes's own file-read rules. These filters are not a general secret detector: a token embedded in an ordinary source file will be captured with that file.
 
 Defaults:
 
-- UTF-8 text snapshots up to 512 KiB per file.
+- UTF-8 text snapshots up to 512 KiB per file (stored in S3, so DynamoDB's 400 KB item limit does not apply).
 - Workspace enumeration up to 3,000 entries, 16 MiB of text, and four seconds, with up to three seconds for Git enumeration. Capture happens on both sides of a command and adds latency.
-- 256 MiB of deduplicated text content. When full, recording reports the problem and tool calls continue.
-- 30-day retention, pruned at most hourly when a recorded tool runs. Unreferenced blobs are deleted; SQLite may retain freed disk pages for reuse.
+- 256 MiB of deduplicated text content, tracked as a running counter. When full, recording reports the problem and tool calls continue. Concurrent writers can overshoot the limit by at most the size of their in-flight snapshots.
+- 30-day retention, pruned at most hourly when a recorded tool runs. Unreferenced blobs are deleted from S3 when their last reference expires.
 - Up to 10,000 change events in one summary, 100 runs in the selector, and 100 operations in a file's history. Summary truncation is labelled.
 - Text diff generation up to 12,000 combined lines.
 
@@ -56,9 +80,12 @@ plugins:
       settings:
         retention_days: 30
         terminal_capture: true
+        dynamodb_table: session-diff
+        s3_bucket: my-session-diff-bucket
+        s3_prefix: session-diff
 ```
 
-Restart the gateway after changing settings. Set `terminal_capture: false` to keep explicit file capture without workspace scans. To erase retained snapshots, stop the gateway and remove only the plugin's `plugin-data/hermes-session-diff` directory.
+Restart the gateway after changing settings. Set `terminal_capture: false` to keep explicit file capture without workspace scans. To erase retained snapshots, stop the gateway and delete the table's items and the `<prefix>/blobs/` objects (or let the retention period expire them).
 
 ## Development checks
 
