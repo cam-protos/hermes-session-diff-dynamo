@@ -515,6 +515,63 @@ class HardeningTests(MockAWS, unittest.TestCase):
         self.store.prune(30)
         self.assertIsNotNone(self.ref(meta["hash"]))
 
+    def test_prune_sweeps_markerless_zero_ref_after_failed_marker_write(self):
+        self.store.touch("s", "r")
+        self.change("s", "r", "/w/a", "abc", "def")
+        self.backdate_changes()
+        real = self.store.db
+
+        def fail(op, n, kw):
+            if op == "update_item" and "SET #d" in kw.get("UpdateExpression", ""):
+                if not any(c == "marker" for c in marks):
+                    marks.append("marker")
+                    return client_error("InternalServerError")
+        marks = []
+        self.store.db = Flaky(real, fail)
+        with self.assertRaises(ClientError):
+            self.store.prune(30)
+        self.store.db = real
+        stuck = [self.ref(i["pk"]["S"][len("BLOB#"):]) for i in self.items("BLOB#")]
+        self.assertTrue(stuck and all(r["refs"] == 0 and "dying" not in r for r in stuck))
+        self.store.prune(30)  # inside DYING_TTL: the release may still be in flight, so leave it
+        self.assertGreater(self.blob_count(), 0)
+        offset = store_module.DYING_TTL + 10
+        fake = type("T", (), {"time": staticmethod(lambda: time.time() + offset), "sleep": staticmethod(lambda s: None)})
+        with patch.object(store_module, "time", fake):
+            self.store.prune(30)
+        self.assertEqual((self.blob_count(), self.budget_bytes()), (0, 0))
+
+    def test_prune_never_touches_live_ref_without_marker(self):
+        meta, data = text("hello")
+        self.store._acquire(meta["hash"], data, 1)
+        self.backdate_refs()
+        self.store.prune(30)
+        self.assertEqual(self.ref(meta["hash"])["refs"], 1)
+        self.assertEqual((self.blob_count(), self.budget_bytes()), (1, 5))
+
+    def test_concurrent_first_acquirers_charge_blob_exactly_once(self):
+        meta, data = text("hello")
+        real_charge, inner = self.store._charge, []
+
+        def charge(ref, size):
+            if not inner:
+                inner.append(1)  # second first-acquirer adds its ref and charges between A's ADD and A's charge
+                self.store._acquire(meta["hash"], data, 1)
+            real_charge(ref, size)
+        with patch.object(self.store, "_charge", side_effect=charge):
+            self.store._acquire(meta["hash"], data, 1)
+        self.assertEqual(self.ref(meta["hash"])["refs"], 2)
+        self.assertEqual(self.stats_vs_charged(), (5, 5))
+
+    def test_charge_of_already_charged_ref_at_full_budget_returns(self):
+        meta, data = text("hello")
+        ref = f"BLOB#{meta['hash']}"
+        with patch.object(store_module, "BUDGET", 100):
+            self.store._acquire(meta["hash"], data, 1)
+            self.ddb.put_item(TableName=TABLE_NAME, Item={"pk": {"S": "STATS"}, "sk": {"S": "BLOBS"}, "bytes": {"N": "100"}})
+            self.store._charge(ref, 5)  # both conditions fail: already charged wins over 'budget is full'
+        self.assertEqual(self.budget_bytes(), 100)
+
     # Defect 3: META/RUN outlive the session's CHG rows
     def chg_rows(self, session="s"):
         return sorted(i["sk"]["S"] for i in self.items(f"S#{session}") if i["sk"]["S"].startswith("CHG#"))

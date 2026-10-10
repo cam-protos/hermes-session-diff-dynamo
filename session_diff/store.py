@@ -454,6 +454,11 @@ class Store:
         for orphan in self._query("gpk = :g", {":g": "BLOB", ":zero": 0, ":stale": stale}, index="gsi",
                                   filter="refs <= :zero AND dying < :stale", limit=max(1, int(limit))):
             digests.add(orphan["pk"][len("BLOB#"):])
+        # A zero-ref REF that never got a marker (the marker write failed after the references dropped): once its
+        # last ref change is older than DYING_TTL it is no longer mid-release, so it is finalized like any orphan.
+        for orphan in self._query("gpk = :g AND gsk < :stale", {":g": "BLOB", ":zero": 0, ":stale": stale}, index="gsi",
+                                  filter="refs <= :zero AND attribute_not_exists(dying)", limit=max(1, int(limit))):
+            digests.add(orphan["pk"][len("BLOB#"):])
         for digest in sorted(digests):
             try:
                 self._finalize(digest)
