@@ -21,6 +21,12 @@ Consistency and operating limits (see docs/reference.md):
   lifecycle rule that expires objects N days after upload is measured from the *last reference*.
   Plugin retention should still be N days or less. No ``s3:ListBucket`` is needed: a missing blob
   reads as 403/404 and surfaces as "Snapshot content is no longer available".
+* A blob REF is ``charged`` (bytes paid to STATS/BLOBS) by whichever acquirer finds it uncharged, in one
+  transaction with the counter; finalize refunds only if ``charged`` is present, in the transaction that
+  deletes the REF. A finalizer owns a blob through a unique ``dying_owner`` token, re-checks it right
+  before deleting the S3 object and aborts if taken over. record() discards its change rows before
+  releasing blobs and keeps the references if the discard cannot be confirmed. META/RUN items are pruned
+  only when the session has no change rows left.
 * Blob REF items carry ``gpk=BLOB`` / ``gsk=<time of last ref change>``. Dropping the last
   reference uses a ``dying`` marker so a releaser cannot delete an S3 object that another writer has
   just re-referenced and re-uploaded. ``prune`` sweeps zero-reference orphans.
@@ -37,6 +43,7 @@ import json
 import os
 import threading
 import time
+import uuid
 from collections import Counter
 from decimal import Decimal
 from pathlib import Path
@@ -71,14 +78,20 @@ THROTTLE_CODES = {"ThrottlingException", "ProvisionedThroughputExceededException
 MISSING_BLOB_CODES = {"AccessDenied", "403", "NoSuchKey", "404"}
 CONDITIONAL_FAILED = "ConditionalCheckFailedException"
 CANCELED = "TransactionCanceledException"
-DYING_TTL = 60  # seconds after which a 'dying' marker is considered abandoned
+DYING_TTL = 60  # a 'dying' marker older than this is abandoned (checked on its own clock, NOT the retention cutoff, which is days)
 ACQUIRE_ATTEMPTS, ACQUIRE_WAIT = 50, 0.1
 THROTTLE_ATTEMPTS = 5
+FINALIZE_ATTEMPTS = 3
 
 
 def _code(exc):
     """The AWS error code of a botocore ClientError (or None)."""
     return (getattr(exc, "response", None) or {}).get("Error", {}).get("Code")
+
+
+def _reasons(exc):
+    """Per-item CancellationReasons of a TransactionCanceledException."""
+    return (getattr(exc, "response", None) or {}).get("CancellationReasons") or []
 
 
 def _client(service, region):
@@ -88,7 +101,7 @@ def _client(service, region):
             import boto3
             from botocore.config import Config
             # Timeouts: connect 3s / read 10s so a DynamoDB or S3 brownout cannot stall a tool call
-            # for more than a few seconds per call. Automatic retries are OFF (one total attempt; botocore's ``max_attempts`` would still allow one retry): botocore
+            # for more than a few seconds per call. Automatic retries are OFF (total_max_attempts=1 means a single attempt, no retries): botocore
             # would replay a mutating UpdateItem ADD after a lost response and double count refs, ids,
             # runs and bytes. Store._call retries only errors that guarantee the request was not applied.
             _clients[(service, region)] = boto3.client(
@@ -179,29 +192,39 @@ class Store:
             args["ConditionExpression"] = condition
         return self._dec(self._call("update_item", **args).get("Attributes", {}))
 
-    def _put_all(self, items):
-        for start in range(0, len(items), 25):
-            pending = [{"PutRequest": {"Item": self._enc(item)}} for item in items[start:start + 25]]
-            for attempt in range(5):
-                pending = self._call("batch_write_item", RequestItems={self.table: pending}).get("UnprocessedItems", {}).get(self.table, [])
+    def _discard(self, keys):
+        """Remove change items a failed record() may have written. True only if EVERY key was deleted."""
+        for start in range(0, len(keys), 25):
+            pending = [{"DeleteRequest": {"Key": self._key(pk, sk)}} for pk, sk in keys[start:start + 25]]
+            for attempt in range(4):
+                try:
+                    pending = self._call("batch_write_item", RequestItems={self.table: pending}).get("UnprocessedItems", {}).get(self.table, [])
+                except Exception:
+                    pending = pending  # outcome unknown: deleting again is idempotent, so just retry
                 if not pending:
                     break
                 time.sleep(0.05 * 2 ** attempt)
             else:
-                raise RuntimeError("DynamoDB did not accept all change records.")
+                return False
+        return True
 
-    def _discard(self, keys):
-        """Best-effort removal of change items a failed record() may have written (batch writes are not atomic)."""
-        for start in range(0, len(keys), 25):
-            pending = [{"DeleteRequest": {"Key": self._key(pk, sk)}} for pk, sk in keys[start:start + 25]]
-            for attempt in range(3):
-                try:
-                    pending = self._call("batch_write_item", RequestItems={self.table: pending}).get("UnprocessedItems", {}).get(self.table, [])
-                except Exception:
-                    break
-                if not pending:
-                    break
-                time.sleep(0.05 * 2 ** attempt)
+    def _put_changes(self, items, written):
+        """Write change rows with a not-exists condition (never overwrite a surviving row), 25 per transaction.
+
+        ``written`` collects the keys that may have landed (a cancelled transaction applied nothing, so its
+        keys are not listed), which is all that _discard may later delete.
+        """
+        for start in range(0, len(items), 25):
+            chunk = items[start:start + 25]
+            keys = [(i["pk"], i["sk"]) for i in chunk]
+            written.extend(keys)
+            ops = [{"Put": {"TableName": self.table, "Item": self._enc(item), "ConditionExpression": "attribute_not_exists(pk)"}} for item in chunk]
+            try:
+                self._call("transact_write_items", TransactItems=ops)
+            except Exception as exc:
+                if _code(exc) == CANCELED:
+                    del written[len(written) - len(keys):]
+                raise
 
     def _blob_key(self, digest):
         return f"{self.prefix}/blobs/{digest}" if self.prefix else f"blobs/{digest}"
@@ -217,8 +240,10 @@ class Store:
 
     # -- blob lifecycle: S3 object + reference count + byte budget --------------
     def _acquire(self, digest, data, count):
-        """Add ``count`` references to a blob and (re)upload it; charge the budget when the blob is new.
+        """Add ``count`` references to a blob and (re)upload it; make sure the blob is charged to the budget.
 
+        Payment is tracked on the REF itself (attribute ``charged`` = bytes paid), so whoever finds the
+        REF uncharged pays, whatever the reference count was, and a release can only refund what was paid.
         The upload happens on every acquire: it is idempotent for a content-addressed key, repairs a
         blob whose first writer failed after taking its reference, and refreshes the object's age so
         a lifecycle rule never expires a blob that is still referenced.
@@ -227,9 +252,9 @@ class Store:
         for attempt in range(ACQUIRE_ATTEMPTS):
             now = time.time()
             try:
-                old = self._update(ref, "REF", "SET #sz = :size, gpk = :gpk, gsk = :now REMOVE #d ADD refs :k",
+                old = self._update(ref, "REF", "SET #sz = :size, gpk = :gpk, gsk = :now REMOVE #d, #o ADD refs :k",
                                    {":k": count, ":size": size, ":gpk": "BLOB", ":now": now, ":stale": now - DYING_TTL},
-                                   names={"#sz": "size", "#d": "dying"},
+                                   names={"#sz": "size", "#d": "dying", "#o": "dying_owner"},
                                    condition="attribute_not_exists(#d) OR #d < :stale", returns="ALL_OLD")
                 break
             except Exception as exc:
@@ -238,21 +263,48 @@ class Store:
                 time.sleep(ACQUIRE_WAIT)  # a releaser is deleting this blob right now
         else:
             raise RuntimeError("A snapshot is being deleted and could not be re-referenced. Try again.")
-        if _num(old.get("refs", 0)) <= 0:  # new, or left at zero references: nobody has paid for it
+        if "charged" not in old:
             try:
-                self._update("STATS", "BLOBS", "ADD #b :n", {":n": size, ":room": BUDGET - size},
-                             names={"#b": "bytes"}, condition="attribute_not_exists(#b) OR #b <= :room")
-            except Exception as exc:
-                if _code(exc) != CONDITIONAL_FAILED:
-                    raise
-                self._release(digest, count, refund=False)
-                raise RuntimeError("The 256 MiB snapshot budget is full. Reduce retention or remove old plugin data.") from None
+                self._charge(ref, size)
+            except Exception:
+                self._release(digest, count)
+                raise
         try:
             self.s3.put_object(Bucket=self.bucket, Key=self._blob_key(digest), Body=data,
                                ContentType="text/plain; charset=utf-8", ServerSideEncryption="AES256")
         except Exception:
             self._release(digest, count)
             raise
+
+    def _charge(self, ref, size):
+        """Charge ``size`` bytes to the budget and mark the REF ``charged``, in ONE transaction.
+
+        If the REF is already charged (another writer paid first) nothing is charged. Because the flag and
+        the byte counter change atomically, a failed charge leaves nobody holding an unpaid-but-flagged
+        blob and a crash cannot leave the flag set without the bytes.
+        """
+        items = [
+            {"Update": {"TableName": self.table, "Key": self._key("STATS", "BLOBS"), "UpdateExpression": "ADD #b :n",
+                        "ConditionExpression": "attribute_not_exists(#b) OR #b <= :room",
+                        "ExpressionAttributeNames": {"#b": "bytes"},
+                        "ExpressionAttributeValues": self._enc({":n": size, ":room": BUDGET - size})}},
+            {"Update": {"TableName": self.table, "Key": self._key(ref, "REF"), "UpdateExpression": "SET charged = :n",
+                        "ConditionExpression": "attribute_not_exists(charged)",
+                        "ExpressionAttributeValues": self._enc({":n": size})}}]
+        for attempt in range(10):
+            try:
+                self._call("transact_write_items", TransactItems=items)
+                return
+            except Exception as exc:
+                if _code(exc) != CANCELED:
+                    raise
+                codes = [r.get("Code") for r in _reasons(exc)]
+                if len(codes) > 1 and codes[1] == "ConditionalCheckFailed":
+                    return  # already charged by another writer
+                if codes and codes[0] == "ConditionalCheckFailed":
+                    raise RuntimeError("The 256 MiB snapshot budget is full. Reduce retention or remove old plugin data.") from None
+                time.sleep(0.05 * (attempt + 1))  # TransactionConflict etc.: nothing was applied
+        raise RuntimeError("Could not charge the snapshot budget after repeated transaction conflicts.")
 
     def _release(self, digest, count, refund=True):
         """Drop ``count`` references; the last one out finalizes (deletes) the blob."""
@@ -264,35 +316,49 @@ class Store:
     def _finalize(self, digest, refund=True):
         """Delete the S3 object, budget and REF of a blob whose references are gone.
 
-        A conditional ``dying`` marker makes one process the owner; writers that want the blob back
-        wait until the REF is gone (or the marker is stale), so the owner can never delete an object
-        that was re-uploaded by a new reference.
+        A conditional ``dying`` marker plus a unique ``dying_owner`` token make one process the owner;
+        writers that want the blob back wait until the REF is gone (or the marker is stale). A stalled
+        owner re-asserts ownership right before deleting and aborts if it was taken over or held the
+        marker for more than half of DYING_TTL, so it can never delete an object a new reference re-uploaded.
+        The refund (only if the REF is ``charged``) and the REF removal are one transaction.
         """
-        now = time.time()
+        now, token = time.time(), uuid.uuid4().hex
+        ref = f"BLOB#{digest}"
         try:
-            item = self._update(f"BLOB#{digest}", "REF", "SET #d = :now", {":now": now, ":zero": 0, ":stale": now - DYING_TTL},
-                                names={"#d": "dying"}, returns="ALL_NEW",
+            item = self._update(ref, "REF", "SET #d = :now, #o = :me", {":now": now, ":me": token, ":zero": 0, ":stale": now - DYING_TTL},
+                                names={"#d": "dying", "#o": "dying_owner"}, returns="ALL_NEW",
                                 condition="refs <= :zero AND (attribute_not_exists(#d) OR #d < :stale)")
         except Exception as exc:
             if _code(exc) != CONDITIONAL_FAILED:
                 raise
             return  # re-referenced, gone, or another releaser owns it
-        self.s3.delete_object(Bucket=self.bucket, Key=self._blob_key(digest))
-        key, size = self._key(f"BLOB#{digest}", "REF"), int(item.get("size", 0))
-        try:
-            if refund and size:
-                # One transaction: the refund and the REF removal happen together or not at all.
-                self._call("transact_write_items", TransactItems=[
-                    {"Update": {"TableName": self.table, "Key": self._key("STATS", "BLOBS"), "UpdateExpression": "ADD #b :n",
-                                "ExpressionAttributeNames": {"#b": "bytes"}, "ExpressionAttributeValues": self._enc({":n": -size})}},
-                    {"Delete": {"TableName": self.table, "Key": key, "ConditionExpression": "refs <= :zero",
-                                "ExpressionAttributeValues": self._enc({":zero": 0})}}])
-            else:
-                self._call("delete_item", TableName=self.table, Key=key, ConditionExpression="refs <= :zero",
-                           ExpressionAttributeValues=self._enc({":zero": 0}))
+        if time.time() - now > DYING_TTL / 2:
+            return  # stalled: leave the marker; the orphan sweep retries once it is stale
+        try:  # still the owner and still unreferenced? (a takeover clears the marker or changes the token)
+            self._update(ref, "REF", "SET gpk = :gpk", {":gpk": "BLOB", ":me": token, ":zero": 0},
+                         names={"#o": "dying_owner"}, condition="#o = :me AND refs <= :zero")
         except Exception as exc:
-            if _code(exc) not in (CONDITIONAL_FAILED, CANCELED):
+            if _code(exc) != CONDITIONAL_FAILED:
                 raise
+            return
+        self.s3.delete_object(Bucket=self.bucket, Key=self._blob_key(digest))
+        charged = int(item.get("charged", 0))  # refund exactly what the REF says was paid (``refund`` is kept for compatibility)
+        ops = [{"Delete": {"TableName": self.table, "Key": self._key(ref, "REF"), "ConditionExpression": "#o = :me AND refs <= :zero",
+                           "ExpressionAttributeNames": {"#o": "dying_owner"},
+                           "ExpressionAttributeValues": self._enc({":me": token, ":zero": 0})}}]
+        if charged:
+            ops.insert(0, {"Update": {"TableName": self.table, "Key": self._key("STATS", "BLOBS"), "UpdateExpression": "ADD #b :n",
+                                      "ExpressionAttributeNames": {"#b": "bytes"}, "ExpressionAttributeValues": self._enc({":n": -charged})}})
+        for attempt in range(FINALIZE_ATTEMPTS):
+            try:
+                self._call("transact_write_items", TransactItems=ops)
+                return
+            except Exception as exc:
+                if _code(exc) == CANCELED and any(r.get("Code") == "ConditionalCheckFailed" for r in _reasons(exc)):
+                    return  # taken over or already gone
+                if attempt == FINALIZE_ATTEMPTS - 1:
+                    raise  # state is left for the orphan sweep (REF at zero refs with a stale marker)
+                time.sleep(0.05 * (attempt + 1))
 
     # -- writes ------------------------------------------------------------------
     def touch(self, session, run, cwd="", notes=()):
@@ -338,17 +404,17 @@ class Store:
                  "tool_id": tool_id, "tool": tool, "source": source, "path": path, "before": json.dumps(old),
                  "after": json.dumps(new), "refs": json.dumps(refs), "created": now, "gpk": "CHG", "gsk": now}
                 for i, (path, old, new, refs) in enumerate(entries)]
-            attempted = [(i["pk"], i["sk"]) for i in items]
-            self._put_all(items)
+            self._put_changes(items, attempted)
         except Exception:
-            # batch_write_item is not atomic: remove any change rows that may have landed BEFORE the
-            # blobs they point at are released.
-            self._discard(attempted)
-            for digest, count in acquired:
-                try:
-                    self._release(digest, count)
-                except Exception:
-                    pass
+            # Remove any change rows that may have landed BEFORE the blobs they point at are released.
+            # If that cannot be confirmed, keep the references (documented leak): a retained blob is
+            # safe, whereas releasing blobs a surviving row still points at would let prune double release.
+            if self._discard(attempted):
+                for digest, count in acquired:
+                    try:
+                        self._release(digest, count)
+                    except Exception:
+                        pass
             raise
 
     def prune(self, days=30, limit=500):
@@ -382,6 +448,12 @@ class Store:
         for orphan in self._query("gpk = :g AND gsk < :c", {":g": "BLOB", ":c": cutoff, ":zero": 0}, index="gsi",
                                   filter="refs <= :zero", limit=max(1, int(limit))):
             digests.add(orphan["pk"][len("BLOB#"):])
+        # A finalizer that died while holding a 'dying' marker: DYING_TTL (not the retention cutoff) decides
+        # when its marker is abandoned, and the REF's gsk (last ref change) may be far newer than the cutoff.
+        stale = time.time() - DYING_TTL
+        for orphan in self._query("gpk = :g", {":g": "BLOB", ":zero": 0, ":stale": stale}, index="gsi",
+                                  filter="refs <= :zero AND dying < :stale", limit=max(1, int(limit))):
+            digests.add(orphan["pk"][len("BLOB#"):])
         for digest in sorted(digests):
             try:
                 self._finalize(digest)
@@ -389,6 +461,10 @@ class Store:
                 errors.append(exc)
         for kind in ("RUN", "META"):
             for item in list(self._query("gpk = :g AND gsk < :c", {":g": kind, ":c": cutoff}, index="gsi")):
+                # META/RUN go only once the session has no change rows left (a limit-truncated prune would
+                # otherwise reset next_id and let record() reuse ids of surviving rows).
+                if next(self._query("pk = :p AND begins_with(sk, :c)", {":p": item["pk"], ":c": "CHG#"}, limit=1), None):
+                    continue
                 try:
                     self._call("delete_item", TableName=self.table, Key=self._key(item["pk"], item["sk"]),
                                ConditionExpression="gsk < :c", ExpressionAttributeValues=self._enc({":c": cutoff}))

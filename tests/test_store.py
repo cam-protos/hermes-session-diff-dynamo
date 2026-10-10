@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import sys
 import threading
@@ -213,12 +214,12 @@ class HardeningTests(MockAWS, unittest.TestCase):
     def test_acquire_reuploads_missing_object_for_existing_ref(self):
         meta, data = text("hello")
         self.ddb.put_item(TableName="session-diff-test", Item={"pk": {"S": f"BLOB#{meta['hash']}"}, "sk": {"S": "REF"},
-                                                              "refs": {"N": "1"}, "size": {"N": "5"}})
+                                                              "refs": {"N": "1"}, "size": {"N": "5"}, "charged": {"N": "5"}})
         self.store._acquire(meta["hash"], data, 1)
         key = self.store._blob_key(meta["hash"])
         self.assertEqual(self.s3.get_object(Bucket=BUCKET, Key=key)["Body"].read(), data)
         self.assertEqual(self.ref(meta["hash"])["refs"], 2)
-        self.assertEqual(self.budget_bytes(), 0)  # REF already existed with refs>0: not charged again
+        self.assertEqual(self.budget_bytes(), 0)  # REF already carries 'charged': not charged again
 
     def test_acquire_refreshes_object_on_every_reference(self):
         meta, data = text("hello")
@@ -249,7 +250,7 @@ class HardeningTests(MockAWS, unittest.TestCase):
                 self.store._acquire(meta["hash"], data, 1)
         self.assertEqual(self.ref(meta["hash"])["refs"], 0)
 
-    def test_acquire_clears_stale_dying_marker_and_recharges_budget(self):
+    def test_acquire_clears_stale_dying_marker_without_recharging(self):
         meta, data = text("hello")
         self.store._acquire(meta["hash"], data, 1)
         self.ddb.update_item(TableName="session-diff-test", Key={"pk": {"S": f"BLOB#{meta['hash']}"}, "sk": {"S": "REF"}},
@@ -259,7 +260,7 @@ class HardeningTests(MockAWS, unittest.TestCase):
         ref = self.ref(meta["hash"])
         self.assertEqual(ref["refs"], 1)
         self.assertNotIn("dying", ref)
-        self.assertEqual(self.budget_bytes(), 10)  # zero-ref blob counts as new (its old charge was never refunded)
+        self.assertEqual(self.budget_bytes(), 5)  # the REF still carries 'charged': its payment stands, no double charge
 
     def test_releaser_does_not_delete_blob_rereferenced_before_marker(self):
         """Another writer re-references between the releaser's ADD(-1) and its dying marker."""
@@ -316,11 +317,11 @@ class HardeningTests(MockAWS, unittest.TestCase):
     def test_failed_batch_removes_written_change_rows_before_releasing_blobs(self):
         self.store.touch("s", "r")
         calls = []
-        original = self.ddb.batch_write_item
+        original = self.ddb.transact_write_items
 
         def batch(**kw):
             calls.append(kw)
-            if len(calls) == 2:  # second batch (26+ items) fails after the first landed
+            if len(calls) == 2:  # second chunk (26+ items) fails after the first landed
                 raise client_error("InternalServerError")
             return original(**kw)
         before, after, blobs = {}, {}, {}
@@ -330,7 +331,7 @@ class HardeningTests(MockAWS, unittest.TestCase):
             blobs[om["hash"]], blobs[nm["hash"]] = od, nd
         order = []
         real_release = self.store._release
-        with patch.object(self.ddb, "batch_write_item", side_effect=batch), \
+        with patch.object(self.ddb, "transact_write_items", side_effect=batch), \
                 patch.object(self.store, "_release", side_effect=lambda *a, **k: (order.append(len(self.items("S#s".replace("S#s", "S#s")))), real_release(*a, **k))):
             with self.assertRaises(ClientError):
                 self.store.record("s", "r", "call", "write_file", "file tool", before, after, blobs)
@@ -339,23 +340,23 @@ class HardeningTests(MockAWS, unittest.TestCase):
         self.assertEqual((self.blob_count(), self.budget_bytes()), (0, 0))
         self.assertTrue(order and all(n == 2 for n in order), order)  # only RUN-less META+... remained when releasing
 
-    def test_unprocessed_items_failure_removes_written_rows(self):
+    def test_failed_write_after_first_chunk_removes_written_rows(self):
         self.store.touch("s", "r")
-        original = self.ddb.batch_write_item
+        original, calls = self.ddb.transact_write_items, []
 
-        def batch(**kw):
-            requests = kw["RequestItems"][TABLE_NAME]
-            if "PutRequest" in requests[0]:
-                if len(requests) > 1:
-                    original(RequestItems={TABLE_NAME: requests[:1]})  # only the first row lands
-                    return {"UnprocessedItems": {TABLE_NAME: requests[1:]}}
-                return {"UnprocessedItems": {TABLE_NAME: requests}}  # never accepted
+        def txn(**kw):
+            calls.append(1)
+            if len(calls) == 2:
+                raise client_error("RequestTimeout")  # outcome unknown
             return original(**kw)
-        with patch.object(self.ddb, "batch_write_item", side_effect=batch), patch.object(store_module.time, "sleep"):
-            with self.assertRaisesRegex(RuntimeError, "did not accept"):
-                (am, ad), (bm, bd), (cm, cd) = text("x"), text("y"), text("z")
-                self.store.record("s", "r", "call", "write_file", "file tool", {"/w/a": am, "/w/b": am},
-                                  {"/w/a": bm, "/w/b": cm}, {am["hash"]: ad, bm["hash"]: bd, cm["hash"]: cd})
+        before, after, blobs = {}, {}, {}
+        for i in range(30):
+            (om, od), (nm, nd) = text(f"c{i}"), text(f"d{i}")
+            before[f"/w/{i}"], after[f"/w/{i}"] = om, nm
+            blobs[om["hash"]], blobs[nm["hash"]] = od, nd
+        with patch.object(self.ddb, "transact_write_items", side_effect=txn), patch.object(store_module.time, "sleep"):
+            with self.assertRaises(ClientError):
+                self.store.record("s", "r", "call", "write_file", "file tool", before, after, blobs)
         self.assertEqual([i for i in self.items("S#s") if i["sk"]["S"].startswith("CHG#")], [])
         self.assertEqual((self.blob_count(), self.budget_bytes()), (0, 0))
 
@@ -428,6 +429,232 @@ class HardeningTests(MockAWS, unittest.TestCase):
         self.assertEqual(self.blob_count(), 2)
         self.assertEqual(self.budget_bytes(), len("shared") + len("fresh"))
         self.assertIn("+fresh", self.store.diff("t", 1, 1)["patch"])
+
+    def stats_vs_charged(self):
+        return self.budget_bytes(), sum(int(i["charged"]["N"]) for i in self.items("BLOB#") if "charged" in i)
+
+    # Defect 1: a failed charge by A must not leave B's live blob unpaid
+    def test_failed_charge_by_first_acquirer_does_not_leave_concurrent_holder_unpaid(self):
+        meta, data = text("hello")
+        self.ddb.put_item(TableName=TABLE_NAME, Item={"pk": {"S": "STATS"}, "sk": {"S": "BLOBS"}, "bytes": {"N": "3"}})
+        entered, proceed = threading.Event(), threading.Event()
+
+        def park(op, n, kw):
+            if op == "transact_write_items":
+                entered.set()
+                proceed.wait(10)
+        other = self.new_store(dynamodb=Flaky(self.ddb, park))
+        result = []
+        thread = threading.Thread(target=lambda: result.append(other._acquire(meta["hash"], data, 1)))
+        real_charge = self.store._charge
+
+        def charge(ref, size):
+            thread.start()  # B adds its reference (sees refs>=1) and parks before charging
+            self.assertTrue(entered.wait(10))
+            real_charge(ref, size)
+        with patch.object(store_module, "BUDGET", 6), patch.object(self.store, "_charge", side_effect=charge):
+            with self.assertRaisesRegex(RuntimeError, "budget is full"):
+                self.store._acquire(meta["hash"], data, 1)
+            self.assertEqual(self.ref(meta["hash"])["refs"], 1)  # only B's reference is left
+            self.ddb.put_item(TableName=TABLE_NAME, Item={"pk": {"S": "STATS"}, "sk": {"S": "BLOBS"}, "bytes": {"N": "0"}})
+            proceed.set()
+            thread.join(10)
+        self.assertEqual(self.stats_vs_charged(), (5, 5))  # B paid; STATS == sum of live charged sizes
+        self.store._release(meta["hash"], 1)
+        self.assertEqual((self.blob_count(), self.budget_bytes()), (0, 0))
+
+    def test_reacquire_of_charged_ref_does_not_recharge_and_release_refunds_once(self):
+        meta, data = text("hello")
+        self.store._acquire(meta["hash"], data, 1)
+        self.store._acquire(meta["hash"], data, 1)
+        self.assertEqual(self.stats_vs_charged(), (5, 5))
+        self.store._release(meta["hash"], 2)
+        self.assertEqual((self.blob_count(), self.budget_bytes()), (0, 0))
+
+    # Defect 2: finalize failure after delete_object
+    def test_finalize_transaction_failure_is_retried_then_swept_and_recharges_once(self):
+        meta, data = text("hello")
+        self.store._acquire(meta["hash"], data, 1)
+        fail = {"left": 3}
+
+        def boom(op, n, kw):
+            if op == "transact_write_items" and fail["left"] > 0:
+                fail["left"] -= 1
+                return client_error("InternalServerError")
+        flaky = Flaky(self.ddb, boom)
+        store = self.new_store(dynamodb=flaky)
+        with patch.object(store_module.time, "sleep"), self.assertRaises(ClientError):
+            store._release(meta["hash"], 1)
+        self.assertEqual(flaky.calls.count("transact_write_items"), 3)  # retried 3 times
+        ref = self.ref(meta["hash"])
+        self.assertEqual((ref["refs"], ref["charged"]), (0, 5))  # S3 object gone, REF + charge remain
+        self.assertEqual(self.s3.list_objects_v2(Bucket=BUCKET).get("KeyCount", 0), 0)
+        self.ddb.update_item(TableName=TABLE_NAME, Key={"pk": {"S": f"BLOB#{meta['hash']}"}, "sk": {"S": "REF"}},
+                             UpdateExpression="SET dying = :old", ExpressionAttributeValues={":old": {"N": str(time.time() - 600)}})
+        # once the marker is stale a re-acquire charges nothing more (the REF still carries 'charged')
+        self.store._acquire(meta["hash"], data, 1)
+        self.assertEqual(self.budget_bytes(), 5)
+        self.store._release(meta["hash"], 1)
+        self.assertEqual((self.blob_count(), self.budget_bytes()), (0, 0))
+
+    def test_prune_sweeps_stale_dying_ref_regardless_of_retention_cutoff(self):
+        meta, data = text("hello")
+        self.store._acquire(meta["hash"], data, 1)
+        self.ddb.update_item(TableName=TABLE_NAME, Key={"pk": {"S": f"BLOB#{meta['hash']}"}, "sk": {"S": "REF"}},
+                             UpdateExpression="SET refs = :z, dying = :old, dying_owner = :o",  # fresh gsk, stale marker
+                             ExpressionAttributeValues={":z": {"N": "0"}, ":old": {"N": str(time.time() - 600)}, ":o": {"S": "dead"}})
+        self.store.prune(30)
+        self.assertEqual((self.blob_count(), self.budget_bytes()), (0, 0))
+
+    def test_prune_leaves_fresh_dying_ref_alone(self):
+        meta, data = text("hello")
+        self.store._acquire(meta["hash"], data, 1)
+        self.ddb.update_item(TableName=TABLE_NAME, Key={"pk": {"S": f"BLOB#{meta['hash']}"}, "sk": {"S": "REF"}},
+                             UpdateExpression="SET refs = :z, dying = :now",
+                             ExpressionAttributeValues={":z": {"N": "0"}, ":now": {"N": str(time.time())}})
+        self.store.prune(30)
+        self.assertIsNotNone(self.ref(meta["hash"]))
+
+    # Defect 3: META/RUN outlive the session's CHG rows
+    def chg_rows(self, session="s"):
+        return sorted(i["sk"]["S"] for i in self.items(f"S#{session}") if i["sk"]["S"].startswith("CHG#"))
+
+    def test_truncated_prune_keeps_meta_so_ids_are_never_reused(self):
+        self.store.touch("s", "r")
+        for i in range(3):
+            self.change("s", "r", f"/w/{i}", f"a{i}", f"b{i}")
+        self.backdate_changes()
+        self.ddb.update_item(TableName=TABLE_NAME, Key={"pk": {"S": "S#s"}, "sk": {"S": "META"}}, UpdateExpression="SET gsk = :z",
+                             ExpressionAttributeValues={":z": {"N": "0"}})
+        self.ddb.update_item(TableName=TABLE_NAME, Key={"pk": {"S": "S#s"}, "sk": {"S": "RUN#r"}}, UpdateExpression="SET gsk = :z",
+                             ExpressionAttributeValues={":z": {"N": "0"}})
+        self.store.prune(1, limit=1)
+        self.assertEqual(len(self.chg_rows()), 2)
+        self.assertEqual(len([i for i in self.items("S#s") if i["sk"]["S"] in ("META", "RUN#r")]), 2)
+        before = {i["sk"]["S"]: i for i in self.items("S#s") if i["sk"]["S"].startswith("CHG#")}
+        self.change("s", "r", "/w/new", "n1", "n2")
+        rows = self.chg_rows()
+        self.assertEqual(rows, ["CHG#000000000002", "CHG#000000000003", "CHG#000000000004"])
+        after = {i["sk"]["S"]: i for i in self.items("S#s") if i["sk"]["S"].startswith("CHG#")}
+        for key, item in before.items():
+            self.assertEqual(after[key], item)  # survivors untouched
+        live = sum(int(json.loads(i["refs"]["S"]).__len__()) for i in after.values())
+        self.assertEqual(sum(self.ref(i["pk"]["S"][5:])["refs"] for i in self.items("BLOB#")), live)
+        self.backdate_changes()
+        for sk in ("META", "RUN#r"):
+            self.ddb.update_item(TableName=TABLE_NAME, Key={"pk": {"S": "S#s"}, "sk": {"S": sk}}, UpdateExpression="SET gsk = :z",
+                                 ExpressionAttributeValues={":z": {"N": "0"}})
+        self.store.prune(1)
+        self.assertEqual((self.blob_count(), self.budget_bytes()), (0, 0))
+        self.assertEqual([i for i in self.items("S#s")], [])  # now META/RUN go too
+
+    def test_record_refuses_to_overwrite_an_existing_change_row(self):
+        self.store.touch("s", "r")
+        self.change("s", "r", "/w/a", "a1", "a2")
+        self.ddb.delete_item(TableName=TABLE_NAME, Key={"pk": {"S": "S#s"}, "sk": {"S": "META"}})  # next_id lost -> reuse attempt
+        with self.assertRaises(ClientError):
+            self.change("s", "r", "/w/b", "b1", "b2")
+        self.assertEqual(self.chg_rows(), ["CHG#000000000001"])
+        self.assertIn("+a2", self.store.diff("s", 1, 1)["patch"])
+        self.assertEqual(self.blob_count(), 2)  # b's blobs were released again
+
+    # Defect 4: discard failure must not release blobs
+    def test_failed_discard_leaves_refs_and_prune_stays_consistent(self):
+        self.store.touch("s", "r")
+        (am, ad), (bm, bd) = text("old"), text("new")
+        real_txn = self.ddb.transact_write_items
+        landed = []
+
+        def txn(**kw):  # the write lands but the response is lost
+            real_txn(**kw)
+            landed.append(1)
+            if any("Put" in op and op["Put"]["Item"]["pk"]["S"].startswith("S#") for op in kw["TransactItems"]):
+                raise client_error("RequestTimeout")
+            return {}
+        with patch.object(self.ddb, "transact_write_items", side_effect=txn), \
+                patch.object(self.ddb, "batch_write_item", side_effect=client_error("InternalServerError")), \
+                patch.object(store_module.time, "sleep"):
+            with self.assertRaises(ClientError):
+                self.store.record("s", "r", "c", "t", "src", {"/w/a": am}, {"/w/a": bm}, {am["hash"]: ad, bm["hash"]: bd})
+        self.assertEqual(len(self.chg_rows()), 1)  # the row survived (discard failed)
+        self.assertEqual(self.ref(am["hash"])["refs"], 1)  # ...so its blobs were NOT released
+        self.assertEqual(self.ref(bm["hash"])["refs"], 1)
+        self.assertIn("+new", self.store.diff("s", 1, 1)["patch"])
+        self.backdate_changes()
+        self.store.prune(1)
+        self.assertEqual((self.blob_count(), self.budget_bytes()), (0, 0))  # released exactly once
+
+    def test_discard_reports_whether_every_key_was_deleted(self):
+        self.store.touch("s", "r")
+        self.assertTrue(self.store._discard([("S#s", "CHG#000000000009")]))
+        flaky = Flaky(self.ddb, lambda op, n, kw: client_error("InternalServerError") if op == "batch_write_item" else None)
+        with patch.object(store_module.time, "sleep"):
+            self.assertFalse(self.new_store(dynamodb=flaky)._discard([("S#s", "CHG#000000000009")]))
+
+    # Defect 5: a stalled finalizer must not delete an object that was taken over
+    def test_stalled_finalizer_aborts_when_marker_was_taken_over(self):
+        meta, data = text("hello")
+        self.store._acquire(meta["hash"], data, 1)
+        other = self.new_store()
+        real_update = self.store._update
+        state = {"done": False}
+
+        def hook(*a, **kw):  # runs right after the finalizer set its marker: a stale-marker takeover happens
+            result = real_update(*a, **kw)
+            if not state["done"] and "#o = :me" in a[2]:
+                state["done"] = True
+                self.ddb.update_item(TableName=TABLE_NAME, Key={"pk": {"S": f"BLOB#{meta['hash']}"}, "sk": {"S": "REF"}},
+                                     UpdateExpression="SET dying = :old", ExpressionAttributeValues={":old": {"N": str(time.time() - 600)}})
+                other._acquire(meta["hash"], data, 1)  # B re-references and re-uploads
+            return result
+        with patch.object(self.store, "_update", side_effect=hook):
+            self.store._release(meta["hash"], 1)
+        self.assertEqual(self.ref(meta["hash"])["refs"], 1)
+        self.assertEqual(self.s3.get_object(Bucket=BUCKET, Key=self.store._blob_key(meta["hash"]))["Body"].read(), data)
+        self.assertEqual(self.budget_bytes(), 5)
+
+    def test_finalizer_stalled_past_half_ttl_aborts_without_deleting(self):
+        meta, data = text("hello")
+        self.store._acquire(meta["hash"], data, 1)
+        clock = iter([1000.0, 1000.0, 1000.0 + store_module.DYING_TTL])
+        fake = type("T", (), {"time": staticmethod(lambda: next(clock, 5000.0)), "sleep": staticmethod(lambda s: None)})
+        with patch.object(store_module, "time", fake):
+            self.store._release(meta["hash"], 1)
+        self.assertIsNotNone(self.ref(meta["hash"]))
+        self.assertEqual(self.s3.list_objects_v2(Bucket=BUCKET).get("KeyCount", 0), 1)
+
+    # Extras
+    def test_prune_retries_transaction_conflicts_and_only_skips_conditional_failures(self):
+        self.store.touch("s", "r")
+        self.change("s", "r", "/w/a", "abc", "def")
+        self.backdate_changes()
+        left = {"n": 2}
+
+        def conflict(op, n, kw):
+            if op == "transact_write_items" and left["n"] > 0:
+                left["n"] -= 1
+                return ClientError({"Error": {"Code": "TransactionCanceledException", "Message": "x"},
+                                    "CancellationReasons": [{"Code": "TransactionConflict"}, {"Code": "None"}, {"Code": "None"}]}, "TransactWriteItems")
+        flaky = Flaky(self.ddb, conflict)
+        with patch.object(store_module.time, "sleep"):
+            self.new_store(dynamodb=flaky).prune(1)
+        self.assertEqual(flaky.calls.count("transact_write_items") >= 3, True)
+        self.assertEqual(self.chg_rows(), [])
+        self.assertEqual((self.blob_count(), self.budget_bytes()), (0, 0))
+
+    def test_orphan_sweep_ignores_referenced_blobs_even_beyond_limit(self):
+        for i in range(4):
+            meta, data = text(f"live{i}")
+            self.store._acquire(meta["hash"], data, 1)
+        self.backdate_refs()
+        orphan, odata = text("orphan")
+        self.store._acquire(orphan["hash"], odata, 1)
+        self.ddb.update_item(TableName=TABLE_NAME, Key={"pk": {"S": f"BLOB#{orphan['hash']}"}, "sk": {"S": "REF"}},
+                             UpdateExpression="SET refs = :z, gsk = :g", ExpressionAttributeValues={":z": {"N": "0"}, ":g": {"N": "1"}})
+        self.store.prune(1, limit=2)  # 4 old live blobs > limit; the orphan must still be found
+        self.assertEqual(self.blob_count(), 4)
+        self.assertEqual(self.budget_bytes(), sum(len(f"live{i}") for i in range(4)))
+        self.assertTrue(all(self.ref(i["pk"]["S"][5:])["refs"] == 1 for i in self.items("BLOB#")))
 
     # 6. missing blobs
     def test_access_denied_blob_is_reported_as_missing(self):
