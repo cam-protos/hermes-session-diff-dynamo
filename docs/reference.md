@@ -54,9 +54,9 @@ Create or choose a private S3 bucket. The plugin never creates resources.
 
 Environment variables win over settings. Credentials come from the standard AWS chain (for example an ECS task role).
 
-Permissions: the **recorder** needs `dynamodb:GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query`, `BatchWriteItem` on the table and its `gsi` index, and `s3:PutObject`, `GetObject`, `DeleteObject` on `<prefix>/blobs/*`. A **read-only viewer** needs only `GetItem` and `Query` on the table and index, and `s3:GetObject` on the same prefix.
+Permissions: the **recorder** needs `dynamodb:GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query`, `BatchWriteItem`, `TransactWriteItems` on the table and its `gsi` index, and `s3:PutObject` (with `AES256` encryption), `GetObject`, `DeleteObject` on `<prefix>/blobs/*`. **`s3:ListBucket` is not needed.** Without it S3 answers `403 AccessDenied` for a missing object; the plugin treats `AccessDenied`/`403`/`NoSuchKey`/`404` as a missing blob and the viewer reports "Snapshot content is no longer available". A **read-only viewer** needs only `GetItem` and `Query` on the table and index, and `s3:GetObject` on the same prefix.
 
-Item layout (for operators): `S#<session>/META`, `S#<session>/RUN#<run>`, `S#<session>/CHG#<id>`, `BLOB#<hash>/REF` (reference count), and `STATS/BLOBS` (byte budget). Blobs are reference counted, so a snapshot shared by several changes is deleted only after the last one expires.
+Item layout (for operators): `S#<session>/META`, `S#<session>/RUN#<run>`, `S#<session>/CHG#<id>`, `BLOB#<hash>/REF` (reference count), and `STATS/BLOBS` (byte budget). Blob `REF` items also carry `gpk=BLOB` and `gsk` = time of the last reference change, which lets `prune` find blobs left at zero references. Blobs are reference counted, so a snapshot shared by several changes is deleted only after the last one expires. The last releaser sets a short-lived `dying` marker before deleting the S3 object; a writer that wants the same blob waits for it (up to about 5 seconds) so it cannot lose a freshly uploaded object.
 
 The recorder excludes common credential filenames, private-key files, dependency/build directories, links, devices, and paths blocked by Hermes's own file-read rules. These filters are not a general secret detector: a token embedded in an ordinary source file will be captured with that file.
 
@@ -65,9 +65,17 @@ Defaults:
 - UTF-8 text snapshots up to 512 KiB per file (stored in S3, so DynamoDB's 400 KB item limit does not apply).
 - Workspace enumeration up to 3,000 entries, 16 MiB of text, and four seconds, with up to three seconds for Git enumeration. Capture happens on both sides of a command and adds latency.
 - 256 MiB of deduplicated text content, tracked as a running counter. When full, recording reports the problem and tool calls continue. Concurrent writers can overshoot the limit by at most the size of their in-flight snapshots.
-- 30-day retention, pruned at most hourly when a recorded tool runs. Unreferenced blobs are deleted from S3 when their last reference expires.
+- 30-day retention, pruned at most hourly when a recorded tool runs. Each prune handles at most 500 change records (`prune(days, limit=500)`), so a large backlog is cleared over several runs; run and session records are always swept. Expiring a change and dropping its blob references is one DynamoDB transaction. Unreferenced blobs are deleted from S3 when their last reference expires, and a later prune also removes blobs a crash left at zero references.
 - Up to 10,000 change events in one summary, 100 runs in the selector, and 100 operations in a file's history. Summary truncation is labelled.
 - Text diff generation up to 12,000 combined lines.
+
+### Consistency and known limits
+
+- **Blobs are re-uploaded on every reference.** Each recorded change that uses a blob writes it to S3 again (idempotent for a content-addressed key). If the bucket has a lifecycle rule that expires objects N days after upload, the clock therefore restarts at the *last reference*, so shared blobs do not expire while still in use. Plugin retention should still be N days or less (30 by default), because a blob that is no longer referenced is not refreshed.
+- **A crash between acquiring blob references and committing a change can leak a reference and its bytes.** Leaked blobs are retained, not lost. The S3 lifecycle (if any) bounds the object, but the `STATS/BLOBS` byte counter is not self-correcting; if it drifts upward, reset it by deleting the `STATS/BLOBS` item after clearing the journal.
+- **Mutating DynamoDB calls are not retried automatically**, because a replayed `ADD` after a lost response would double count references, ids or bytes. The clients are configured with a single attempt, and only throttling errors (`ThrottlingException`, `ProvisionedThroughputExceededException`, `RequestLimitExceeded`, `ThrottledException`, which guarantee the request was not applied) are retried, up to 5 attempts with backoff. A lost response surfaces as a recorder error (tool calls continue) and at worst a leaked count.
+- Timeouts are 3 s connect / 10 s read per call so a DynamoDB or S3 brownout cannot stall a tool call for more than a few seconds per call.
+- A failed multi-row write removes the change rows it may have written before it releases its blob references.
 
 The file/byte/time caps can make workspace coverage partial; the pane labels this. Excluded, unreadable and unstable files are not silently treated as deletions.
 

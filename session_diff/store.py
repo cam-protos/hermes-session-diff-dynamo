@@ -14,6 +14,22 @@ global secondary index ``gsi`` on ``gpk``/``gsk``)::
 Snapshot contents are content-addressed S3 objects at ``<prefix>/blobs/<hash>``.
 Change IDs stay small integers (the HTTP API addresses them) and are allocated
 per session from an atomic counter on the session's META item.
+
+Consistency and operating limits (see docs/reference.md):
+
+* Every reference to a blob re-uploads it (idempotent for a content-addressed key), so a bucket
+  lifecycle rule that expires objects N days after upload is measured from the *last reference*.
+  Plugin retention should still be N days or less. No ``s3:ListBucket`` is needed: a missing blob
+  reads as 403/404 and surfaces as "Snapshot content is no longer available".
+* Blob REF items carry ``gpk=BLOB`` / ``gsk=<time of last ref change>``. Dropping the last
+  reference uses a ``dying`` marker so a releaser cannot delete an S3 object that another writer has
+  just re-referenced and re-uploaded. ``prune`` sweeps zero-reference orphans.
+* Mutating DynamoDB calls are NOT retried automatically (a replayed ``ADD`` after a lost response
+  would double count). Only throttling errors, which guarantee the request was not applied, are retried.
+* A crash between acquiring blob references and committing a change can leak a reference and its
+  bytes (known limit): the blob is retained rather than lost, the S3 lifecycle bounds the object, but
+  the STATS byte counter is not self-correcting.
+* ``prune`` handles at most ``limit`` change records per call.
 """
 
 import difflib
@@ -51,6 +67,18 @@ def table_definition(name):
 
 
 _clients, _clients_lock = {}, threading.Lock()
+THROTTLE_CODES = {"ThrottlingException", "ProvisionedThroughputExceededException", "RequestLimitExceeded", "ThrottledException"}
+MISSING_BLOB_CODES = {"AccessDenied", "403", "NoSuchKey", "404"}
+CONDITIONAL_FAILED = "ConditionalCheckFailedException"
+CANCELED = "TransactionCanceledException"
+DYING_TTL = 60  # seconds after which a 'dying' marker is considered abandoned
+ACQUIRE_ATTEMPTS, ACQUIRE_WAIT = 50, 0.1
+THROTTLE_ATTEMPTS = 5
+
+
+def _code(exc):
+    """The AWS error code of a botocore ClientError (or None)."""
+    return (getattr(exc, "response", None) or {}).get("Error", {}).get("Code")
 
 
 def _client(service, region):
@@ -59,9 +87,13 @@ def _client(service, region):
         if (service, region) not in _clients:
             import boto3
             from botocore.config import Config
+            # Timeouts: connect 3s / read 10s so a DynamoDB or S3 brownout cannot stall a tool call
+            # for more than a few seconds per call. Automatic retries are OFF (one total attempt; botocore's ``max_attempts`` would still allow one retry): botocore
+            # would replay a mutating UpdateItem ADD after a lost response and double count refs, ids,
+            # runs and bytes. Store._call retries only errors that guarantee the request was not applied.
             _clients[(service, region)] = boto3.client(
                 service, region_name=region,
-                config=Config(connect_timeout=3, read_timeout=10, retries={"max_attempts": 4, "mode": "standard"}))
+                config=Config(connect_timeout=3, read_timeout=10, retries={"total_max_attempts": 1, "mode": "standard"}))
         return _clients[(service, region)]
 
 
@@ -96,8 +128,23 @@ class Store:
     def _key(self, pk, sk):
         return self._enc({"pk": pk, "sk": sk})
 
+    def _call(self, op, **args):
+        """Run a DynamoDB operation, retrying ONLY throttling errors.
+
+        Throttling codes guarantee the request was not applied, so replaying is safe. Any other error
+        (including a timeout whose outcome is unknown) is raised: replaying a non-idempotent write such
+        as ``ADD`` could silently double count.
+        """
+        for attempt in range(THROTTLE_ATTEMPTS):
+            try:
+                return getattr(self.db, op)(**args)
+            except Exception as exc:
+                if _code(exc) not in THROTTLE_CODES or attempt == THROTTLE_ATTEMPTS - 1:
+                    raise
+                time.sleep(0.05 * 2 ** attempt)
+
     def _get(self, pk, sk):
-        found = self.db.get_item(TableName=self.table, Key=self._key(pk, sk), ConsistentRead=True)
+        found = self._call("get_item", TableName=self.table, Key=self._key(pk, sk), ConsistentRead=True)
         return self._dec(found["Item"]) if "Item" in found else None
 
     def _query(self, condition, values, names=None, index=None, forward=True, filter=None, limit=None):
@@ -113,7 +160,7 @@ class Store:
             args["FilterExpression"] = filter
         count = 0
         while True:
-            page = self.db.query(**args)
+            page = self._call("query", **args)
             for item in page.get("Items", []):
                 yield self._dec(item)
                 count += 1
@@ -130,18 +177,31 @@ class Store:
             args["ExpressionAttributeNames"] = names
         if condition:
             args["ConditionExpression"] = condition
-        return self._dec(self.db.update_item(**args).get("Attributes", {}))
+        return self._dec(self._call("update_item", **args).get("Attributes", {}))
 
     def _put_all(self, items):
         for start in range(0, len(items), 25):
             pending = [{"PutRequest": {"Item": self._enc(item)}} for item in items[start:start + 25]]
-            for attempt in range(8):
-                pending = self.db.batch_write_item(RequestItems={self.table: pending}).get("UnprocessedItems", {}).get(self.table, [])
+            for attempt in range(5):
+                pending = self._call("batch_write_item", RequestItems={self.table: pending}).get("UnprocessedItems", {}).get(self.table, [])
                 if not pending:
                     break
                 time.sleep(0.05 * 2 ** attempt)
             else:
                 raise RuntimeError("DynamoDB did not accept all change records.")
+
+    def _discard(self, keys):
+        """Best-effort removal of change items a failed record() may have written (batch writes are not atomic)."""
+        for start in range(0, len(keys), 25):
+            pending = [{"DeleteRequest": {"Key": self._key(pk, sk)}} for pk, sk in keys[start:start + 25]]
+            for attempt in range(3):
+                try:
+                    pending = self._call("batch_write_item", RequestItems={self.table: pending}).get("UnprocessedItems", {}).get(self.table, [])
+                except Exception:
+                    break
+                if not pending:
+                    break
+                time.sleep(0.05 * 2 ** attempt)
 
     def _blob_key(self, digest):
         return f"{self.prefix}/blobs/{digest}" if self.prefix else f"blobs/{digest}"
@@ -149,22 +209,44 @@ class Store:
     def _read_blob(self, digest):
         try:
             return self.s3.get_object(Bucket=self.bucket, Key=self._blob_key(digest))["Body"].read()
-        except self.s3.exceptions.NoSuchKey:
-            return None
+        except Exception as exc:
+            # Without s3:ListBucket, S3 answers 403 AccessDenied (not NoSuchKey) for a missing object.
+            if _code(exc) in MISSING_BLOB_CODES:
+                return None
+            raise
 
     # -- blob lifecycle: S3 object + reference count + byte budget --------------
     def _acquire(self, digest, data, count):
-        """Add ``count`` references to a blob, uploading it (within budget) on first reference."""
-        old = self._update(f"BLOB#{digest}", "REF", "ADD refs :k SET #sz = :size",
-                           {":k": count, ":size": len(data)}, names={"#sz": "size"}, returns="ALL_OLD")
-        if "refs" in old:
-            return
-        try:
-            self._update("STATS", "BLOBS", "ADD #b :n", {":n": len(data), ":room": BUDGET - len(data)},
-                         names={"#b": "bytes"}, condition="attribute_not_exists(#b) OR #b <= :room")
-        except self.db.exceptions.ConditionalCheckFailedException:
-            self._release(digest, count, refund=False)
-            raise RuntimeError("The 256 MiB snapshot budget is full. Reduce retention or remove old plugin data.") from None
+        """Add ``count`` references to a blob and (re)upload it; charge the budget when the blob is new.
+
+        The upload happens on every acquire: it is idempotent for a content-addressed key, repairs a
+        blob whose first writer failed after taking its reference, and refreshes the object's age so
+        a lifecycle rule never expires a blob that is still referenced.
+        """
+        size, ref = len(data), f"BLOB#{digest}"
+        for attempt in range(ACQUIRE_ATTEMPTS):
+            now = time.time()
+            try:
+                old = self._update(ref, "REF", "SET #sz = :size, gpk = :gpk, gsk = :now REMOVE #d ADD refs :k",
+                                   {":k": count, ":size": size, ":gpk": "BLOB", ":now": now, ":stale": now - DYING_TTL},
+                                   names={"#sz": "size", "#d": "dying"},
+                                   condition="attribute_not_exists(#d) OR #d < :stale", returns="ALL_OLD")
+                break
+            except Exception as exc:
+                if _code(exc) != CONDITIONAL_FAILED:
+                    raise
+                time.sleep(ACQUIRE_WAIT)  # a releaser is deleting this blob right now
+        else:
+            raise RuntimeError("A snapshot is being deleted and could not be re-referenced. Try again.")
+        if _num(old.get("refs", 0)) <= 0:  # new, or left at zero references: nobody has paid for it
+            try:
+                self._update("STATS", "BLOBS", "ADD #b :n", {":n": size, ":room": BUDGET - size},
+                             names={"#b": "bytes"}, condition="attribute_not_exists(#b) OR #b <= :room")
+            except Exception as exc:
+                if _code(exc) != CONDITIONAL_FAILED:
+                    raise
+                self._release(digest, count, refund=False)
+                raise RuntimeError("The 256 MiB snapshot budget is full. Reduce retention or remove old plugin data.") from None
         try:
             self.s3.put_object(Bucket=self.bucket, Key=self._blob_key(digest), Body=data,
                                ContentType="text/plain; charset=utf-8", ServerSideEncryption="AES256")
@@ -173,18 +255,44 @@ class Store:
             raise
 
     def _release(self, digest, count, refund=True):
-        """Drop ``count`` references; the last one out deletes the item, the S3 object and its budget."""
-        now = self._update(f"BLOB#{digest}", "REF", "ADD refs :k", {":k": -count}, returns="ALL_NEW")
-        if now.get("refs", 0) > 0:
-            return
+        """Drop ``count`` references; the last one out finalizes (deletes) the blob."""
+        now = self._update(f"BLOB#{digest}", "REF", "ADD refs :k SET gpk = :gpk, gsk = :now",
+                           {":k": -count, ":gpk": "BLOB", ":now": time.time()}, returns="ALL_NEW")
+        if now.get("refs", 0) <= 0:
+            self._finalize(digest, refund)
+
+    def _finalize(self, digest, refund=True):
+        """Delete the S3 object, budget and REF of a blob whose references are gone.
+
+        A conditional ``dying`` marker makes one process the owner; writers that want the blob back
+        wait until the REF is gone (or the marker is stale), so the owner can never delete an object
+        that was re-uploaded by a new reference.
+        """
+        now = time.time()
         try:
-            self.db.delete_item(TableName=self.table, Key=self._key(f"BLOB#{digest}", "REF"),
-                                ConditionExpression="refs <= :zero", ExpressionAttributeValues=self._enc({":zero": 0}))
-        except self.db.exceptions.ConditionalCheckFailedException:
-            return  # re-referenced in the meantime; that writer owns it now
-        if refund and "size" in now:
-            self._update("STATS", "BLOBS", "ADD #b :n", {":n": -int(now["size"])}, names={"#b": "bytes"})
+            item = self._update(f"BLOB#{digest}", "REF", "SET #d = :now", {":now": now, ":zero": 0, ":stale": now - DYING_TTL},
+                                names={"#d": "dying"}, returns="ALL_NEW",
+                                condition="refs <= :zero AND (attribute_not_exists(#d) OR #d < :stale)")
+        except Exception as exc:
+            if _code(exc) != CONDITIONAL_FAILED:
+                raise
+            return  # re-referenced, gone, or another releaser owns it
         self.s3.delete_object(Bucket=self.bucket, Key=self._blob_key(digest))
+        key, size = self._key(f"BLOB#{digest}", "REF"), int(item.get("size", 0))
+        try:
+            if refund and size:
+                # One transaction: the refund and the REF removal happen together or not at all.
+                self._call("transact_write_items", TransactItems=[
+                    {"Update": {"TableName": self.table, "Key": self._key("STATS", "BLOBS"), "UpdateExpression": "ADD #b :n",
+                                "ExpressionAttributeNames": {"#b": "bytes"}, "ExpressionAttributeValues": self._enc({":n": -size})}},
+                    {"Delete": {"TableName": self.table, "Key": key, "ConditionExpression": "refs <= :zero",
+                                "ExpressionAttributeValues": self._enc({":zero": 0})}}])
+            else:
+                self._call("delete_item", TableName=self.table, Key=key, ConditionExpression="refs <= :zero",
+                           ExpressionAttributeValues=self._enc({":zero": 0}))
+        except Exception as exc:
+            if _code(exc) not in (CONDITIONAL_FAILED, CANCELED):
+                raise
 
     # -- writes ------------------------------------------------------------------
     def touch(self, session, run, cwd="", notes=()):
@@ -216,7 +324,7 @@ class Store:
             entries.append((path, old, new, refs))
         if not entries:
             return
-        acquired = []
+        acquired, attempted = [], []
         try:
             for digest, count in Counter(h for *_, refs in entries for h in refs).items():
                 self._acquire(digest, blobs[digest], count)
@@ -225,12 +333,17 @@ class Store:
             end = self._update(f"S#{session}", "META", "SET sess = :s, updated = :now, gpk = :gpk, gsk = :now ADD next_id :n",
                                {":s": session, ":now": now, ":gpk": "META", ":n": len(entries)}, returns="UPDATED_NEW")["next_id"]
             first = int(end) - len(entries) + 1
-            self._put_all([
+            items = [
                 {"pk": f"S#{session}", "sk": f"CHG#{first + i:012d}", "id": first + i, "sess": session, "run": run,
                  "tool_id": tool_id, "tool": tool, "source": source, "path": path, "before": json.dumps(old),
                  "after": json.dumps(new), "refs": json.dumps(refs), "created": now, "gpk": "CHG", "gsk": now}
-                for i, (path, old, new, refs) in enumerate(entries)])
+                for i, (path, old, new, refs) in enumerate(entries)]
+            attempted = [(i["pk"], i["sk"]) for i in items]
+            self._put_all(items)
         except Exception:
+            # batch_write_item is not atomic: remove any change rows that may have landed BEFORE the
+            # blobs they point at are released.
+            self._discard(attempted)
             for digest, count in acquired:
                 try:
                     self._release(digest, count)
@@ -238,19 +351,52 @@ class Store:
                     pass
             raise
 
-    def prune(self, days=30):
+    def prune(self, days=30, limit=500):
+        """Expire records older than ``days``; handles at most ``limit`` change records per call."""
         cutoff = time.time() - max(1, min(int(days), 365)) * 86400
-        for kind in ("CHG", "RUN", "META"):
+        digests, errors = set(), []
+        for item in list(self._query("gpk = :g AND gsk < :c", {":g": "CHG", ":c": cutoff}, index="gsi", limit=max(1, int(limit)))):
+            counts = Counter(json.loads(item.get("refs", "[]")))
+            ops = [{"Delete": {"TableName": self.table, "Key": self._key(item["pk"], item["sk"]),
+                               "ConditionExpression": "attribute_exists(pk) AND gsk < :c",
+                               "ExpressionAttributeValues": self._enc({":c": cutoff})}}]
+            ops += [{"Update": {"TableName": self.table, "Key": self._key(f"BLOB#{digest}", "REF"),
+                                "UpdateExpression": "ADD refs :neg SET gpk = :b, gsk = :now",
+                                "ExpressionAttributeValues": self._enc({":neg": -n, ":b": "BLOB", ":now": time.time()})}}
+                    for digest, n in counts.items()]
+            for attempt in range(10):
+                try:  # deleting the change and dropping its references is one atomic, idempotent step
+                    self._call("transact_write_items", TransactItems=ops)
+                    digests.update(counts)
+                    break
+                except Exception as exc:
+                    if _code(exc) != CANCELED:
+                        raise
+                    reasons = (getattr(exc, "response", {}) or {}).get("CancellationReasons") or []
+                    if reasons and reasons[0].get("Code") == "ConditionalCheckFailed":
+                        break  # already deleted by another pruner, or refreshed since the index read
+                    time.sleep(0.05 * (attempt + 1))  # TransactionConflict etc.: nothing was applied, try again
+            else:
+                errors.append(RuntimeError("Could not expire a change record after repeated transaction conflicts."))
+        # Repair: blobs left at zero references (crash after the transaction, before finalize).
+        for orphan in self._query("gpk = :g AND gsk < :c", {":g": "BLOB", ":c": cutoff, ":zero": 0}, index="gsi",
+                                  filter="refs <= :zero", limit=max(1, int(limit))):
+            digests.add(orphan["pk"][len("BLOB#"):])
+        for digest in sorted(digests):
+            try:
+                self._finalize(digest)
+            except Exception as exc:
+                errors.append(exc)
+        for kind in ("RUN", "META"):
             for item in list(self._query("gpk = :g AND gsk < :c", {":g": kind, ":c": cutoff}, index="gsi")):
                 try:
-                    gone = self.db.delete_item(TableName=self.table, Key=self._key(item["pk"], item["sk"]), ReturnValues="ALL_OLD",
-                                               ConditionExpression="gsk < :c", ExpressionAttributeValues=self._enc({":c": cutoff}))
-                except self.db.exceptions.ConditionalCheckFailedException:
-                    continue  # refreshed since the index read
-                # Only the process whose delete succeeded releases references, so counts cannot double-drop.
-                if kind == "CHG" and "Attributes" in gone:
-                    for digest, count in Counter(json.loads(self._dec(gone["Attributes"]).get("refs", "[]"))).items():
-                        self._release(digest, count)
+                    self._call("delete_item", TableName=self.table, Key=self._key(item["pk"], item["sk"]),
+                               ConditionExpression="gsk < :c", ExpressionAttributeValues=self._enc({":c": cutoff}))
+                except Exception as exc:
+                    if _code(exc) != CONDITIONAL_FAILED:
+                        raise  # a refreshed record is skipped
+        if errors:
+            raise errors[0]
 
     # -- reads -------------------------------------------------------------------
     def sessions(self):
