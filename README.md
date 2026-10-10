@@ -59,9 +59,9 @@ Prefer a download? Extract the [release ZIP](https://github.com/Adolanium/hermes
 
 The [60-second demo](https://github.com/Adolanium/hermes-session-diff/releases/download/v0.1.0/hermes-session-diff-real-app.mp4) shows this in the real Windows app, including the restart. Cursor animation and zooms are added in the video; waiting time is shortened.
 
-## Stored locally
+## Stored in DynamoDB and S3
 
-The journal lives at `$HERMES_HOME/plugin-data/hermes-session-diff/changes.sqlite3`, with **30-day retention** by default. The plugin adds no telemetry, external storage service, or model requests. A remote Desktop viewer reads the journal through your gateway's authenticated connection.
+This fork replaces the local SQLite file with **DynamoDB** (run and change records) and **S3** (snapshot contents), so the journal works on read-only, ephemeral or network filesystems and can be read from any host with access. Set `SESSION_DIFF_TABLE` and `SESSION_DIFF_BUCKET` (or the `dynamodb_table` / `s3_bucket` settings); see [storage and limits](docs/reference.md#storage-limits-and-settings) for the table schema and IAM permissions. Retention is **30 days** by default. The plugin adds no telemetry or model requests. A remote Desktop viewer reads the journal through your gateway's authenticated connection.
 
 Snapshots contain file contents. Common credential filenames, ignored dependency directories, binary files, and oversized text are excluded or recorded as metadata only. These filters cannot detect every secret embedded in an ordinary source file. See [storage and limits](docs/reference.md#storage-limits-and-settings) for exact defaults and configuration.
 

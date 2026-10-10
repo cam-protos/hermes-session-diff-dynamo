@@ -1,6 +1,5 @@
 import importlib.util
 import os
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -11,17 +10,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from session_diff.recorder import Recorder, file_targets
 from session_diff.store import Store
+from aws import MockAWS
 from session_diff.capture import snapshot, workspace
 
 
-class RecorderTests(unittest.TestCase):
+class RecorderTests(MockAWS, unittest.TestCase):
     def setUp(self):
+        super().setUp()
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.work = self.root / 'workspace'
         self.work.mkdir()
-        self.store = Store(self.root / 'data')
+        self.store = self.new_store()
         work = self.work
 
         class Paths:
@@ -42,7 +43,7 @@ class RecorderTests(unittest.TestCase):
         path.write_text('user edit\n', encoding='utf-8')
         self.assertEqual(self.call(lambda: (path.write_text('agent edit\n'), 'ok')[1]), 'ok')
         self.call(lambda: path.write_text('user edit\n'))
-        reopened = Store(self.root / 'data')
+        reopened = self.new_store()
         file = reopened.view('session-a')['files'][0]
         self.assertEqual((file['status'], file['edits']), ('restored', 2))
         self.assertEqual(reopened.diff('session-a', file['first_id'], file['last_id'])['patch'], '')
@@ -120,8 +121,7 @@ class RecorderTests(unittest.TestCase):
         file = self.store.view('session-a')['files'][0]
         self.assertEqual(file['after']['kind'], 'binary')
         self.assertIn('Binary', self.store.diff('session-a', file['first_id'], file['last_id'])['note'])
-        with self.store.connect() as db:
-            self.assertEqual(db.execute('SELECT COUNT(*) FROM blobs').fetchone()[0], 0)
+        self.assertEqual(self.blob_count(), 0)
 
     def test_patch_paths_and_newline_export(self):
         self.assertEqual(file_targets({'patch': '*** Update File: a\n*** Move to: b\n*** Delete File: c'}), ['a', 'b', 'c'])
@@ -161,13 +161,12 @@ class RecorderTests(unittest.TestCase):
 
     def test_expiration_removes_unreferenced_contents(self):
         self.call(lambda: (self.work / 'app.txt').write_text('recorded'))
-        with self.store.connect() as db:
-            db.execute('UPDATE changes SET created=0')
-            db.execute('UPDATE runs SET updated=0')
+        self.assertEqual(self.blob_count(), 1)
+        self.age_everything()
         self.store.prune(1)
         self.assertEqual(self.store.sessions(), [])
-        with self.store.connect() as db:
-            self.assertEqual(db.execute('SELECT COUNT(*) FROM blobs').fetchone()[0], 0)
+        self.assertEqual(self.blob_count(), 0)
+        self.assertEqual(self.budget_bytes(), 0)
 
     def test_unsupported_environment_does_not_capture_local_files(self):
         self.recorder.paths_factory = lambda task: (_ for _ in ()).throw(RuntimeError('Unsupported environment'))

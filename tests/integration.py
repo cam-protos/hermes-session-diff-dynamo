@@ -1,4 +1,4 @@
-"""Run with a Hermes Python environment. Every write is under a temporary home."""
+"""Run with a Hermes Python environment (plus moto). Every write is under a temporary home and moto's in-memory AWS."""
 
 import importlib.util
 import argparse
@@ -30,6 +30,18 @@ def main():
         for key in list(os.environ):
             if key.endswith(('_API_KEY', '_TOKEN')):
                 os.environ.pop(key, None)
+        for key, value in {'AWS_ACCESS_KEY_ID': 'testing', 'AWS_SECRET_ACCESS_KEY': 'testing', 'AWS_SESSION_TOKEN': 'testing',
+                           'AWS_DEFAULT_REGION': 'us-east-1', 'SESSION_DIFF_TABLE': 'session-diff-integration',
+                           'SESSION_DIFF_BUCKET': 'session-diff-integration', 'SESSION_DIFF_REGION': 'us-east-1'}.items():
+            os.environ[key] = value
+        import boto3
+        from moto import mock_aws
+        moto = mock_aws()
+        moto.start()
+        sys.path.insert(0, str(PLUGIN))
+        from session_diff.store import table_definition
+        boto3.client('dynamodb', region_name='us-east-1').create_table(**table_definition('session-diff-integration'))
+        boto3.client('s3', region_name='us-east-1').create_bucket(Bucket='session-diff-integration')
         installed = home / 'plugins' / 'hermes-session-diff'
         if args.archive:
             with zipfile.ZipFile(args.archive) as archive:

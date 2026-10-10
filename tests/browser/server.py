@@ -15,6 +15,17 @@ def main():
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='session-diff-preview-') as tmp:
         os.environ['HERMES_HOME'] = str(Path(tmp) / 'home')
+        # Journal storage is DynamoDB + S3; the preview uses moto's in-memory AWS.
+        for key, value in {'AWS_ACCESS_KEY_ID': 'testing', 'AWS_SECRET_ACCESS_KEY': 'testing', 'AWS_SESSION_TOKEN': 'testing',
+                           'AWS_DEFAULT_REGION': 'us-east-1', 'SESSION_DIFF_TABLE': 'session-diff-preview',
+                           'SESSION_DIFF_BUCKET': 'session-diff-preview', 'SESSION_DIFF_REGION': 'us-east-1'}.items():
+            os.environ[key] = value
+        import boto3
+        from moto import mock_aws
+        mock_aws().start()
+        from session_diff.store import table_definition
+        boto3.client('dynamodb', region_name='us-east-1').create_table(**table_definition('session-diff-preview'))
+        boto3.client('s3', region_name='us-east-1').create_bucket(Bucket='session-diff-preview')
         from session_diff.recorder import Recorder
         from session_diff.store import Store
         from session_diff.api import router

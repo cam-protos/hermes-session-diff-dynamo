@@ -10,7 +10,24 @@ provides_tools: []
 provides_hooks: [pre_llm_call]
 provides_middleware: [tool_execution]
 requires_env: []
+python_dependencies: ["boto3>=1.26"]
 config_schema:
+  dynamodb_table:
+    type: string
+    default: ""
+    description: DynamoDB table holding the change journal. SESSION_DIFF_TABLE overrides it.
+  s3_bucket:
+    type: string
+    default: ""
+    description: S3 bucket holding snapshot contents. SESSION_DIFF_BUCKET overrides it.
+  s3_prefix:
+    type: string
+    default: session-diff
+    description: Key prefix for snapshot objects. SESSION_DIFF_PREFIX overrides it.
+  aws_region:
+    type: string
+    default: ""
+    description: AWS region for both services. SESSION_DIFF_REGION overrides it; empty uses the default AWS chain.
   retention_days:
     type: integer
     default: 30
